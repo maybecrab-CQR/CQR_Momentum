@@ -1,4 +1,4 @@
-"""CQR｜全市場動能決策臺 — 視覺與圖表互動優化版
+"""CQR｜全市場動能決策臺 — v19 清爽介面、MA21與個股盤中更新版
 執行：python -m streamlit run app.py
 安裝：pip install streamlit pandas yfinance plotly streamlit-aggrid beautifulsoup4 requests tzdata
 策略：全市場板塊 5／10／20 日 RS（含正負值）→ 成分股相對強弱 → 官方股期標記。
@@ -11,6 +11,8 @@ import json
 import re
 import requests
 import tempfile
+import time as clock
+import threading
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, time
@@ -224,8 +226,8 @@ def normalize(frame):
 def yahoo_history(ticker,period,interval="1d",adjusted=True):
     # 同時查長區間與近一個月，解決部分 Yahoo 長區間回應落後。
     obj=yf.Ticker(ticker);parts=[];errors=[]
-    for kwargs in ({"period":period},{"start":(taipei_now()-timedelta(days=30)).strftime("%Y-%m-%d"),
-                                          "end":(taipei_now()+timedelta(days=1)).strftime("%Y-%m-%d")}):
+    requests_to_make=({"period":"5d"},) if interval=="1m" else ({"period":period},{"start":(taipei_now()-timedelta(days=30)).strftime("%Y-%m-%d"),"end":(taipei_now()+timedelta(days=1)).strftime("%Y-%m-%d")})
+    for kwargs in requests_to_make:
         try:
             f=normalize(obj.history(interval=interval,auto_adjust=adjusted,timeout=15,**kwargs))
             if not f.empty:parts.append(f)
@@ -273,7 +275,7 @@ def chart_yahoo(ticker,period,interval):
     raise ValueError("; ".join(errors) or "無行情")
 
 
-@st.cache_data(ttl=15, show_spinner=False)
+@st.cache_data(ttl=300, show_spinner=False)
 def chart_history(ticker, period, interval):
     if interval.endswith("m"):
         frame=chart_yahoo(ticker,period,interval)
@@ -558,7 +560,120 @@ def public_quotes(channels):
             if error:errors.append(error)
     # Benchmark is refreshed after batching; timestamps still gate every stock below.
     quotes.update(mis_batch(["tse_t00.tw"]))
-    return quotes,errors,"公開盤中快照（非逐筆；延遲依來源）"
+    return quotes,errors,"證交所 MIS 盤中快照"
+
+
+
+@st.cache_resource
+def yahoo_state16():
+    return {'lock':threading.Lock(),'cooldown':0.,'day':None,'cursor':0,'frames':{}}
+
+
+def is_rate_limit16(exc):
+    return any(x in str(exc).lower() for x in ('429','ratelimit','rate limited','too many requests'))
+
+
+@st.cache_data(ttl=21600,show_spinner=False)
+def daily_reference16(symbol,previous):
+    f=yahoo_minute_frame(yf.Ticker(symbol).history(period='1mo',interval='1d',auto_adjust=False,actions=False,raise_errors=True,timeout=12))
+    f=f.loc[f.index.date==previous]
+    if f.empty:raise ValueError(f'{symbol} 缺少 {previous} 正式日線昨收')
+    return float(f.Close.iloc[-1])
+
+
+def aligned_quote16(code,frame,anchor,reference,alignment=300):
+    frame=yahoo_minute_frame(frame)
+    f=frame.loc[(frame.index.date==anchor.date())&(frame.index<=anchor)].between_time('09:00','13:30')
+    if f.empty:raise ValueError('共同截止時間以前無當日分鐘棒')
+    stamp=f.index[-1]
+    if (anchor-stamp).total_seconds()>alignment:raise ValueError('個股與大盤時間差超過設定')
+    # Keep original bar timestamp, never replace with anchor/request time.
+    return quote_record(code,f.Close.iloc[-1],reference,stamp,Open=float(f.Open.iloc[0]),High=float(f.High.max()),Low=float(f.Low.min()),Volume=float(f.Volume.sum(min_count=1)),reference_kind='前一交易日正式收盤',source='Yahoo延遲分鐘資料')
+
+
+@st.cache_data(ttl=300,show_spinner=False)
+def yahoo_scan16(members,asof,max_age,alignment):
+    state=yahoo_state16()
+    if clock.monotonic()<state['cooldown']:raise ValueError('Yahoo限流冷卻中，請稍後再試；手動更新不會取消冷卻')
+    if not state['lock'].acquire(blocking=False):raise ValueError('另一輪Yahoo掃描進行中，請等待完成')
+    try:
+        now=pd.Timestamp(taipei_now());diag={'started_at':str(now),'requested_stocks':len(members),'errors':[]}
+        previous=expected_session(datetime.combine(asof,time(8),tzinfo=ZoneInfo('Asia/Taipei')))
+        if previous is None:raise ValueError('交易日曆不可用，不能猜測前一交易日')
+        benchmark=yahoo_minute_frame(yf.Ticker('^TWII').history(period='1d',interval='1m',auto_adjust=False,actions=False,raise_errors=True,timeout=12))
+        completed=benchmark.loc[(benchmark.index.date==asof)&(benchmark.index+pd.Timedelta(minutes=1)<=now)].between_time('09:00','13:30') if not benchmark.empty else benchmark
+        if completed.empty:raise ValueError(f'Yahoo未提供 {asof} 已完成大盤分鐘棒')
+        anchor=completed.index[-1]
+        intraday=now.date()==asof and time(9)<=now.time()<time(13,30)
+        if intraday and (now-anchor).total_seconds()>max_age:raise ValueError(f'Yahoo大盤截至 {anchor}，已超過容許延遲 {max_age/60:.0f} 分鐘')
+        try:refs,ref_errors,_=closing_quotes(previous)
+        except Exception as exc:refs={};ref_errors=[str(exc)]
+        diag['previous_close_date']=str(previous);diag['previous_close_errors']=ref_errors
+        ref=refs.get('^TWII',{}).get('price') or daily_reference16('^TWII',previous)
+        quotes={'^TWII':aligned_quote16('^TWII',completed,anchor,ref,alignment)}
+        if state['day']!=asof:state.update(day=asof,cursor=0,frames={})
+        start=state['cursor']%max(1,len(members));ordered=list(members[start:])+list(members[:start]);began=clock.monotonic();attempted=0
+        def read(member):
+            code,symbol=member
+            try:
+                f=yahoo_minute_frame(yf.Ticker(symbol).history(period='1d',interval='1m',auto_adjust=False,actions=False,raise_errors=True,timeout=12))
+                if f.empty:raise ValueError('Yahoo回傳空分鐘資料')
+                return code,f,None
+            except Exception as exc:return code,None,str(exc)
+        for offset in range(0,len(ordered),12):
+            if clock.monotonic()-began>=240:diag['stop_reason']='本輪240秒預算已到，下輪從未查詢處繼續';break
+            batch=ordered[offset:offset+12]
+            with ThreadPoolExecutor(max_workers=3) as pool:results=list(pool.map(read,batch))
+            attempted+=len(batch);limited=False
+            for code,f,error in results:
+                if error:
+                    diag['errors'].append({'code':code,'stage':'download','error':error})
+                    if is_rate_limit16(error):limited=True
+                else:state['frames'][code]=f
+            if limited:
+                state['cooldown']=clock.monotonic()+300
+                diag['stop_reason']='Yahoo限流，停止後續批次並冷卻5分鐘';break
+        state['cursor']=(start+attempted)%max(1,len(members))
+        diag['attempted_this_round']=attempted;diag['next_start_offset']=state['cursor'];diag['anchor']=str(anchor)
+        diag['downloaded_stock_frames']=len(state['frames']);diag['missing_previous_close']=0
+        missing_refs=[symbol for code,symbol in members if code in state['frames'] and code not in refs]
+        if missing_refs:
+            fixed,notes=repair_history17(missing_refs,[previous],limit=40)
+            diag['reference_repair_notes']=notes
+            refs=dict(refs)
+            for code,symbol in members:
+                value=fixed.get(symbol,{}).get(previous)
+                if value and code not in refs:refs[code]={'price':value}
+        current=pd.Timestamp(taipei_now())
+        for code,symbol in members:
+            f=state['frames'].get(code)
+            if f is None:continue
+            reference=refs.get(code,{}).get('price')
+            if not reference:
+                diag['missing_previous_close']+=1
+                diag['errors'].append({'code':code,'stage':'reference','error':'缺少前一交易日正式收盤；保留下載結果，不用尾盤分鐘價猜昨收'})
+                continue
+            try:
+                q=aligned_quote16(code,f,anchor,reference,alignment)
+                if intraday and (current-q['timestamp']).total_seconds()>max_age:raise ValueError('下載完成時報價已過期')
+                quotes[code]=q
+            except Exception as exc:diag['errors'].append({'code':code,'stage':'alignment','error':str(exc)})
+        diag['valid_stock_quotes']=len(quotes)-1;diag['finished_at']=str(current)
+        age=(current-anchor).total_seconds()/60
+        source=f'Yahoo分鐘資料 · 截至 {anchor:%m/%d %H:%M} · '+(f'落後 {age:.1f} 分鐘（非逐筆）' if intraday else '盤後歷史快照，非正式收盤價')
+        errors=[f"{x['code']} {x['stage']}：{x['error']}" for x in diag['errors']]
+        if diag.get('stop_reason'):errors.insert(0,diag['stop_reason'])
+        return quotes,errors,source,None if intraday else asof,'Yahoo延遲掃描' if intraday else 'Yahoo盤後歷史快照',diag
+    except Exception as exc:
+        if is_rate_limit16(exc):state['cooldown']=clock.monotonic()+300
+        raise
+    finally:state['lock'].release()
+
+
+def load_yahoo16(universe,max_age,alignment):
+    asof=expected_session(taipei_now().replace(hour=14,minute=0,second=0,microsecond=0))
+    if asof is None:raise ValueError('交易日曆不可用')
+    return yahoo_scan16(tuple(zip(universe.code,universe.ticker)),asof,max_age,alignment)
 
 
 def broker_quotes(path,now=None,max_age=120):
@@ -654,7 +769,9 @@ def resolve_snapshot(state,key,loader):
     try:
         result=loader()
         if result["valid"]==0 and result["all_sectors"].empty:
-            raise ValueError("；".join(result["missing"]) or "沒有有效行情")
+            if not result.get("quotes"):
+                raise ValueError("；".join(result["missing"]) or "沒有有效行情")
+            return result,False,None
         state[key]=result
         return result,False,None
     except Exception as exc:
@@ -697,20 +814,20 @@ def intraday_tables(universe,quotes,now=None,max_age=120,closing_day=None):
     return pd.DataFrame(rows,columns=columns).sort_values("動能(%)",ascending=False).reset_index(drop=True),groups,missing,len(valid)
 
 
-@st.cache_data(ttl=86400,show_spinner=False)
+@st.cache_data(ttl=300,show_spinner=False)
 def historical_close_snapshot(day):
     quotes,errors,source=closing_quotes(day)
-    if errors:raise ValueError("歷史收盤資料不完整："+"；".join(errors))
+    if not quotes:raise ValueError("歷史收盤資料不完整："+"；".join(errors))
     return quotes
 
 
 @st.cache_data(ttl=300,show_spinner=False)
-def market_history_window(asof):
+def market_history_window(asof,periods=20):
     # One bulk request per market/day, shared by every stock and all lookbacks.
     previous=expected_session(datetime.combine(asof,time(8),tzinfo=ZoneInfo("Asia/Taipei")))
     market=ranking_history("^TWII",previous)
-    days=list(market.index[market.index.date<asof][-20:].date)
-    if len(days)<20 or days[-1]!=previous:raise ValueError("大盤歷史交易日不足或尚未更新，無法計算 20 日比較")
+    days=list(market.index[market.index.date<asof][-periods:].date)
+    if len(days)<periods or days[-1]!=previous:raise ValueError(f"大盤歷史交易日不足或尚未更新，無法計算 {periods} 日比較")
     def read(day):
         try:return day,historical_close_snapshot(day),None
         except Exception as exc:return day,{},f"{day}：{exc}"
@@ -718,38 +835,132 @@ def market_history_window(asof):
     return days,{day:q for day,q,error in items},[error for day,q,error in items if error]
 
 
+@st.cache_resource
+def history_repair_state17():
+    return {'lock':threading.Lock(),'frames':{},'attempts':{}}
+
+
+def repair_history17(symbols,days,limit=120):
+    """Bounded daily-history fallback. Keep dates exact; never fill missing sessions."""
+    state=history_repair_state17();quotes_state=yahoo_state16();result={};notes=[]
+    if not days:return result,notes
+    required=set(days);key_day=max(days)
+    if not state['lock'].acquire(blocking=False):return {},['歷史補資料已在執行，下一輪再檢查']
+    try:
+        pending=[]
+        for symbol in dict.fromkeys(symbols):
+            item=state['frames'].get(symbol)
+            if item is not None and required.issubset(set(item.index.date)):
+                result[symbol]={d:float(item.loc[item.index.date==d,'Close'].iloc[-1]) for d in days};continue
+            if clock.monotonic()-state['attempts'].get((symbol,key_day),-1e9)>=300:pending.append(symbol)
+        pending.sort(key=lambda sym:state['attempts'].get((sym,key_day),-1e9))
+        started=clock.monotonic();attempted=0
+        def read(symbol):
+            try:
+                f=yahoo_minute_frame(yf.Ticker(symbol).history(period='3mo',interval='1d',auto_adjust=False,actions=False,raise_errors=True,timeout=12))
+                f=f.loc[f.index.date<=key_day]
+                if f.empty:raise ValueError('日線回傳空資料')
+                return symbol,f,None
+            except Exception as exc:return symbol,None,str(exc)
+        for offset in range(0,min(limit,len(pending)),6):
+            if clock.monotonic()<quotes_state['cooldown']:
+                notes.append('Yahoo限流冷卻中，保留歷史缺口');break
+            if clock.monotonic()-started>=90:
+                notes.append('本輪歷史補資料時間已到，下輪繼續');break
+            batch=pending[offset:min(offset+6,limit)]
+            with ThreadPoolExecutor(max_workers=2) as pool:items=list(pool.map(read,batch))
+            limited=False;attempted+=len(batch)
+            for symbol,f,error in items:
+                state['attempts'][(symbol,key_day)]=clock.monotonic()
+                if error:
+                    notes.append(f'{symbol} 日線補資料：{error}')
+                    if is_rate_limit16(error):limited=True
+                else:
+                    state['frames'][symbol]=f
+                    # Partial successful dates can repair individual cells, without fabricating others.
+                    result[symbol]={d:float(f.loc[f.index.date==d,'Close'].iloc[-1]) for d in days if d in set(f.index.date)}
+            if limited:
+                quotes_state['cooldown']=clock.monotonic()+300;notes.append('Yahoo日線限流，停止補資料');break
+        if len(pending)>attempted:notes.append(f'尚有 {len(pending)-attempted} 檔待補日線；受單輪上限／冷卻限制')
+        return result,notes
+    finally:state['lock'].release()
+
+
 def multiday_market_tables(universe,quotes,periods=10,now=None,max_age=120,closing_day=None,history=None):
-    daily,daily_groups,missing,valid_count=intraday_tables(universe,quotes,now,max_age,closing_day)
-    if valid_count==0:return daily,{},missing,0
-    asof=quotes['^TWII']['timestamp'].date()
-    days,past,errors=history if history is not None else market_history_window(asof)
-    days=[day for day in days if day<asof][-periods:]
-    if len(days)!=periods:raise ValueError(f"歷史資料不足，無法計算 {periods} 日 RS")
-    if any('^TWII' not in past.get(day,{}) for day in days):
-        raise ValueError("大盤歷史收盤缺漏："+'；'.join(errors))
-    calendar=pd.DatetimeIndex([pd.Timestamp(day,tz='Asia/Taipei') for day in days+[asof]])
-    benchmark=pd.Series([past[day]['^TWII']['price'] for day in days]+[quotes['^TWII']['price']],index=calendar)
-    rows=[];groups={};missing=list(missing)+errors;eligible_count=0
-    for name,group in daily_groups.items():
-        members=universe.loc[universe.sector==name]
-        frames={}
-        for ticker in group['members']:
-            code=ticker.split('.')[0]
-            if any(code not in past.get(day,{}) for day in days):
-                missing.append(f"{code}：{periods} 日歷史資料不齊");continue
-            values=[past[day][code]['price'] for day in days]+[quotes[code]['price']]
-            frames[ticker]=pd.DataFrame({'Close':values},index=calendar)
+    now=pd.Timestamp(now or taipei_now());market=quotes.get('^TWII')
+    columns=['趨勢','族群板塊','動能(%)','漲幅(%)','覆蓋','資料日']
+    records=[];current={};errors=[];sector_audit=[]
+    def fresh(q):
+        if not q:return False
+        stamp=q['timestamp']
+        return stamp.date()==closing_day if closing_day is not None else stamp.date()==now.date() and -5<=(now-stamp).total_seconds()<=max_age
+    benchmark_ok=fresh(market)
+    for r in universe.itertuples():
+        q=quotes.get(r.code);status='行情有效'
+        if not q:status='缺報價或昨收'
+        elif not fresh(q):status='報價日期不符或過期'
+        elif not benchmark_ok:status='大盤無有效報價'
+        elif abs((q['timestamp']-market['timestamp']).total_seconds())>max_age:status='與大盤時間差過大'
+        else:current[r.code]=q
+        records.append({'代碼':r.code,'名稱':r.name,'板塊':r.sector,'狀態':status,'缺歷史日期':'','報價時間':str(q['timestamp']) if q else ''})
+    received=sum(r.code in quotes for r in universe.itertuples());history_complete=set();included=set();groups={};rows=[]
+    def finish():
+        counts={}
+        for r in records:counts[r['狀態']]=counts.get(r['狀態'],0)+1
+        table=pd.DataFrame(rows,columns=columns).sort_values('動能(%)',ascending=False).reset_index(drop=True)
+        table.attrs['audit17']={'counts':{'名單股數':len(universe),'有價格及參考價':received,'通過時間檢查':len(current),'歷史齊全':len(history_complete),'進入板塊排名':len(included)},'excluded_counts':counts,'stocks':records,'sectors':sector_audit,'errors':errors,'history_source':'交易所；缺漏時以Yahoo未還原日線補齊'}
+        missing=[f"{r['代碼']}：{r['狀態']} {r['缺歷史日期']}" for r in records if r['狀態']!='進入板塊排名']+errors
+        if not rows:missing.insert(0,f'行情有效 {len(current)} 檔，歷史齊全 {len(history_complete)} 檔；沒有板塊通過覆蓋門檻，請看排除明細')
+        return table,groups,missing,len(included)
+    if not current:return finish()
+    asof=market['timestamp'].date()
+    try:
+        days,past,history_errors=history if history is not None else market_history_window(asof,periods)
+        errors.extend(history_errors);days=[d for d in days if d<asof][-periods:]
+        if len(days)!=periods:raise ValueError(f'需 {periods} 個共同歷史交易日，實際 {len(days)}')
+    except Exception as exc:
+        errors.append(str(exc))
+        for r in records:
+            if r['代碼'] in current:r['狀態']='歷史交易日取得失敗'
+        return finish()
+    # Copy shared cached data before repairing individual missing prices.
+    past={d:dict(past.get(d,{})) for d in days}
+    symbols={r.code:r.ticker for r in universe.itertuples() if r.code in current};symbols['^TWII']='^TWII'
+    need=[symbol for code,symbol in symbols.items() if any(code not in past[d] for d in days)]
+    if need and history is None:
+        fixes,notes=repair_history17(need,days);errors.extend(notes)
+        for code,symbol in symbols.items():
+            for d,value in fixes.get(symbol,{}).items():
+                if code not in past[d] and math.isfinite(value) and value>0:past[d][code]={'price':value,'source':'Yahoo未還原日線補齊'}
+    if any('^TWII' not in past[d] for d in days):
+        errors.append('大盤歷史仍缺漏，暫停RS；不使用零值或前值填補')
+        for r in records:
+            if r['代碼'] in current:r['狀態']='大盤歷史不足'
+        return finish()
+    calendar=pd.DatetimeIndex([pd.Timestamp(d,tz='Asia/Taipei') for d in days+[asof]])
+    benchmark=pd.Series([past[d]['^TWII']['price'] for d in days]+[market['price']],index=calendar)
+    bycode={r['代碼']:r for r in records};frames={}
+    for code,q in current.items():
+        absent=[str(d) for d in days if code not in past[d]]
+        if absent:
+            bycode[code]['狀態']='個股歷史不足';bycode[code]['缺歷史日期']=','.join(absent);continue
+        history_complete.add(code)
+        frames[symbols[code]]=pd.DataFrame({'Close':[past[d][code]['price'] for d in days]+[q['price']]},index=calendar)
+        bycode[code]['狀態']='板塊覆蓋不足'
+    for name,members in universe.groupby('sector',sort=True):
+        minimum=max(min(3,len(members)),math.ceil(len(members)*.8))
+        complete=[c for c in members.code if c in history_complete]
+        sector_audit.append({'板塊':name,'全部':len(members),'有價格及參考價':sum(c in quotes for c in members.code),'時間有效':sum(c in current for c in members.code),'歷史齊全':len(complete),'最低需要':minimum,'尚缺':max(0,minimum-len(complete)),'狀態':'可排名' if len(complete)>=minimum else '覆蓋不足'})
         basket,valid,excluded=equal_weight_basket(list(members.ticker),frames,calendar)
         if basket.empty:continue
         rs=rs_momentum(basket.Close,benchmark,periods)
         changes={ticker:(quotes[ticker.split('.')[0]]['price']/quotes[ticker.split('.')[0]]['reference']-1)*100 for ticker in valid}
-        eligible_count+=len(valid)
-        groups[name]={'basket':basket,'members':valid,'rs':rs,'missing':excluded,'day_changes':changes,'quotes':group['quotes']}
-        rows.append({'趨勢':'強勢' if rs>0 else '弱勢','族群板塊':name,'動能(%)':rs*100,
-                     '漲幅(%)':sum(changes.values())/len(changes),'覆蓋':f"{len(valid)}/{len(members)}",'資料日':str(asof)})
-    table=pd.DataFrame(rows,columns=daily.columns).sort_values('動能(%)',ascending=False).reset_index(drop=True)
-    if table.empty:raise ValueError(f"當日報價可用 {valid_count} 檔，但 {periods} 日歷史覆蓋不足，暫無可比較板塊。"+'；'.join(errors[:2]))
-    return table,groups,missing,eligible_count
+        codes=[t.split('.')[0] for t in valid];included.update(codes)
+        for c in codes:bycode[c]['狀態']='進入板塊排名'
+        groups[name]={'basket':basket,'members':valid,'rs':rs,'missing':excluded,'day_changes':changes,'quotes':{c:quotes[c] for c in codes}}
+        rows.append({'趨勢':'強勢' if rs>0 else '弱勢','族群板塊':name,'動能(%)':rs*100,'漲幅(%)':sum(changes.values())/len(changes),'覆蓋':f'{len(valid)}/{len(members)}','資料日':str(asof)})
+    return finish()
+
 
 
 def chip_number(value):
@@ -899,6 +1110,7 @@ def chip_history_reports(market,kind,target,count=10):
     return sorted(items,key=lambda item:item[0])
 
 
+@st.cache_data(ttl=300,show_spinner=False,max_entries=256)
 def stock_chip_history(code,ticker,market,kind,target,count=10):
     reports=chip_history_reports(market,kind,target,count)
     errors=[];rows=[]
@@ -928,7 +1140,7 @@ def interactive_chart_component():
 const frame=document.getElementById('inner');let last='';
 const send=(type,extra={})=>parent.postMessage({isStreamlitMessage:true,type,...extra},'*');
 window.addEventListener('message',e=>{if(e.data.type==='streamlit:render'){const a=e.data.args;frame.style.height=a.height+'px';if(last!==a.html){last=a.html;frame.srcdoc=a.html;}send('streamlit:setFrameHeight',{height:a.height});}
-if(e.source===frame.contentWindow&&e.data.type==='cq-timeframe'&&['日K','周K','月K','15分','30分','60分'].includes(e.data.value)){send('streamlit:setComponentValue',{value:{timeframe:e.data.value,event:Date.now()},dataType:'json'});}});
+if(e.source===frame.contentWindow&&e.data.type==='cq-timeframe'&&['日K','周K','月K','1分','15分','30分','60分'].includes(e.data.value)){send('streamlit:setComponentValue',{value:{timeframe:e.data.value,event:Date.now()},dataType:'json'});}});
 send('streamlit:componentReady',{apiVersion:1});
 </script></body></html>''',encoding='utf-8')
     return components.declare_component('cqr_interactive_chart',path=str(path))
@@ -982,6 +1194,7 @@ def chip_trend_html(rows,kind,mode,height):
 </style><script>'''+plotly_bundle()+'''</script></head><body><div class="shell"><div class="caption">'''+caption+'''</div><div id="chip-graph" class="chart"></div><div class="table"><table><thead><tr>'''+heads+'''</tr></thead><tbody>'''+body+'''</tbody></table></div><div class="note">'''+notes+'''</div></div><script>const f='''+payload+''';Plotly.newPlot('chip-graph',f.data,f.layout,{responsive:true,displayModeBar:false,displaylogo:false});</script></body></html>'''
 
 
+@st.fragment
 def render_chip_trends(code,name,ticker,market,kind,quote,workspace):
     title,count_col,mode_col=st.columns([2.8,1,1.4])
     with title:st.markdown(f'<div class="stock-head"><h2>{escape(name)}</h2><span class="stock-code">{code}</span></div>',unsafe_allow_html=True)
@@ -1003,7 +1216,7 @@ def render_chip_trends(code,name,ticker,market,kind,quote,workspace):
 
 def indicators(frame):
     frame = frame.copy()
-    for n in (3, 10, 52):
+    for n in (3, 10, 21, 52):
         frame[f"MA{n}"] = frame["Close"].rolling(n).mean()
     for n in (5, 13, 34):
         frame[f"VMA{n}"] = frame["Volume"].rolling(n).mean()
@@ -1069,17 +1282,18 @@ def plotly_bundle():
     return get_plotlyjs()
 
 
+@st.cache_data(ttl=300,show_spinner=False,max_entries=32)
 def chart_html(frame, ticker, interval, height=600):
     df = indicators(frame)
     labels = df.index.strftime("%Y-%m-%d %H:%M" if interval.endswith("m") else "%Y-%m-%d").tolist()
     x = list(range(len(df)))  # 連續交易棒座標，週末與休市不佔空間
-    colors = ["#eed393", "#acbed5", "#b48a64"]
+    colors = ["#eed393", "#acbed5", "#86b7ee", "#b48a64"]
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=.045, row_heights=[.76,.24])
     fig.add_trace(go.Candlestick(x=x, open=df.Open.tolist(), high=df.High.tolist(), low=df.Low.tolist(), close=df.Close.tolist(),
         name="K線", increasing=dict(line=dict(color="#f17c7e",width=1),fillcolor="#f17c7e"),
         decreasing=dict(line=dict(color="#55c8a4",width=1),fillcolor="#55c8a4"),
         text=labels, hoverinfo="text+name"),row=1,col=1)
-    for n, color in zip((3,10,52), colors):
+    for n, color in zip((3,10,21,52), colors):
         fig.add_trace(go.Scatter(x=x,y=df[f"MA{n}"].tolist(),name=f"MA{n}",line=dict(color=color,width=1.5),
             hovertemplate=f"MA{n} %{{y:.2f}}<extra></extra>"),row=1,col=1)
     fig.add_trace(go.Bar(x=x,y=df.Volume.tolist(),name="成交量",marker_color=["#f17c7e" if c>o else "#55c8a4" for c,o in zip(df.Close,df.Open)],opacity=.65,
@@ -1088,7 +1302,7 @@ def chart_html(frame, ticker, interval, height=600):
         fig.add_trace(go.Scatter(x=x,y=df[f"VMA{n}"].tolist(),name=f"VMA{n}",line=dict(color=color,width=1,dash="dot"),
             hovertemplate=f"VMA{n} %{{y:,.0f}}<extra></extra>"),row=2,col=1)
     # 下一根新增時會移出的第 -N 根：均價取收盤價，均量取成交量。
-    for row, periods, column, prefix in [(1,(3,10,52),"Close","MA"),(2,(5,13,34),"Volume","VMA")]:
+    for row, periods, column, prefix in [(1,(3,10,21,52),"Close","MA"),(2,(5,13,34),"Volume","VMA")]:
         for i,(n,color) in enumerate(zip(periods,colors)):
             if len(df)>=n:
                 fig.add_annotation(x=len(df)-n,y=float(df[column].iloc[-n]),xref="x" if row==1 else "x2",yref="y" if row==1 else "y2",
@@ -1111,7 +1325,7 @@ def chart_html(frame, ticker, interval, height=600):
     def values(series):
         return [None if pd.isna(v) else float(v) for v in series]
     meta = {"labels":labels,"open":values(df.Open),"high":values(df.High),"low":values(df.Low),"close":values(df.Close),
-            "volume":values(df.Volume),"priceLines":[values(df[f"MA{n}"]) for n in (3,10,52)],
+            "volume":values(df.Volume),"priceLines":[values(df[f"MA{n}"]) for n in (3,10,21,52)],
             "volumeLines":[values(df[f"VMA{n}"]) for n in (5,13,34)],"key":f"cq-viewport-v2-{ticker}-{interval}","height":height,"timeframe":interval}
     template = CHART_TEMPLATE.replace("__PLOTLY__",plotly_bundle()).replace("__FIGURE__",json.dumps(payload).replace("</","<\\/"))
     return template.replace("__META__",json.dumps(meta).replace("</","<\\/"))
@@ -1123,16 +1337,16 @@ CHART_TEMPLATE = r'''<!doctype html><html lang="zh-Hant"><head><meta charset="ut
 #timeframe{background:#1a2633;color:#e7ce97;border:1px solid #65593f;border-radius:5px;padding:5px;font:inherit;max-width:80px}button{background:transparent;color:#9aaabd;border:1px solid transparent;border-radius:5px;padding:6px 9px;font:inherit;cursor:pointer}button:hover{background:#243144;color:#f0dba2}button.active{background:#353024;color:#ead29a;border-color:#67583b}button:focus-visible{outline:2px solid #d6bd80}.sep{height:18px;width:1px;background:#334051;margin:0 4px}.spacer{flex:1}.label{font-size:10px;color:#71829a;letter-spacing:1px}.ohlc{padding:10px 14px 0;min-height:30px;color:#a1afc1;font:11px monospace;line-height:1.5}.hint{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;padding:8px 13px;border-top:1px solid #25303e;color:#7e8fa6;font-size:10px}#chart{width:100%}.shell:fullscreen{height:100vh;border:0;border-radius:0;display:flex;flex-direction:column}.shell:fullscreen #chart{flex:1;min-height:0}
 body{font-size:14px}.bar-date{padding-top:6px!important}.ohlc{padding-top:3px!important;padding-bottom:6px!important}.ohlc b{font-size:18px!important}#ma-values{padding-bottom:2px!important}.label,.hint{font-size:12px;color:#b2bed0}.toolbar{gap:3px;padding:9px}.toolbar button{padding:7px}.ohlc{display:grid;grid-template-columns:repeat(5,1fr);gap:8px;padding:7px 14px 12px}.ohlc span{display:block;font:12px "Microsoft JhengHei",sans-serif;color:#a9b6c9}.ohlc b{display:block;font:600 19px "Segoe UI",sans-serif;color:#eff3fa;font-variant-numeric:tabular-nums}.bar-date{padding:12px 14px 0;font-size:13px;color:#dcc58c}#ma-values{padding:0 14px 8px;color:#c7b88f;font-size:13px}.chart-wrap{position:relative}.cross,.axis-tag{position:absolute;pointer-events:none;display:none;z-index:20}.vertical{border-left:1px dashed #e5cf9b}.horizontal{border-top:1px dashed #c4b58f;opacity:.7}.axis-tag{background:#e3cb94;color:#101721;border-radius:3px;padding:3px 5px;font:600 12px monospace;white-space:nowrap}.time-tag{font-size:12px}.shell:fullscreen .chart-wrap{flex:1;min-height:0}
 body{font-size:16px}.toolbar{flex-wrap:wrap;gap:3px;padding:6px}.toolbar button{padding:5px}.ohlc b{font-size:21px!important}.ohlc span{font-size:14px}.bar-date,#ma-values{font-size:14px}.ohlc>div{min-width:0}.ohlc b{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.axis-tag{font-size:14px}.hint{font-size:12px}
-#deduct-values{padding:0 14px 4px;font-size:13px;line-height:20px}#deduct-values .deduct-row{display:flex;gap:12px;white-space:nowrap}#deduct-values .deduct-title{color:#b7c5d6;min-width:108px}#deduct-values .deduct-item{font-variant-numeric:tabular-nums}#deduct-values b{font-size:14px}
+#deduct-values{padding:0 14px 4px;font-size:13px;line-height:20px}#deduct-values .deduct-row{display:flex;flex-wrap:wrap;gap:4px 12px;white-space:nowrap}#deduct-values .deduct-title{color:#b7c5d6;min-width:108px}#deduct-values .deduct-item{font-variant-numeric:tabular-nums}#deduct-values b{font-size:14px}
 @media(max-width:600px){.ohlc b{font-size:16px}.ohlc{gap:5px}.toolbar button{font-size:12px}}
 </style><script>__PLOTLY__</script></head><body><div class="shell" id="shell">
-<div class="toolbar"><span class="label">視野</span><button data-bars="30">30 根</button><button data-bars="60">60 根</button><button data-bars="120">120 根</button><button data-bars="all">全部</button><span class="sep"></span><button id="auto" class="active" title="可視 K 棒與均線自動適配價格及成交量軸">自動 Y 軸</button><button id="deduct" class="active" title="標示以最新 K 棒為準、下一根將移出的均價／均量資料">扣抵標示</button><select id="timeframe" aria-label="K線週期" title="切換K線週期"><option value="日K">日K</option><option value="周K">周K</option><option value="月K">月K</option><option value="15分">15分</option><option value="30分">30分</option><option value="60分">60分</option></select><span class="spacer"></span><button id="latest" class="active">回到最新</button><button id="reset">重設</button><button id="full">全螢幕</button></div>
+<div class="toolbar"><span class="label">視野</span><button data-bars="30">30 根</button><button data-bars="60">60 根</button><button data-bars="120">120 根</button><button data-bars="all">全部</button><span class="sep"></span><button id="auto" class="active" title="可視 K 棒與均線自動適配價格及成交量軸">自動 Y 軸</button><button id="deduct" class="active" title="標示以最新 K 棒為準、下一根將移出的均價／均量資料">扣抵標示</button><select id="timeframe" aria-label="K線週期" title="切換K線週期"><option value="日K">日K</option><option value="周K">周K</option><option value="月K">月K</option><option value="1分">1分</option><option value="15分">15分</option><option value="30分">30分</option><option value="60分">60分</option></select><span class="spacer"></span><button id="latest" class="active">回到最新</button><button id="reset">重設</button><button id="full">全螢幕</button></div>
 <div class="bar-date" id="bar-date"></div><div class="ohlc">
 <div><span>開盤</span><b id="v-open"></b></div><div><span>最高</span><b id="v-high"></b></div><div><span>最低</span><b id="v-low"></b></div><div><span>收盤</span><b id="v-close"></b></div><div><span>成交量（張）</span><b id="v-volume"></b></div></div>
 <div id="ma-values"></div><div id="deduct-values" aria-label="下一根扣抵值"></div><div class="chart-wrap"><div id="chart"></div><div id="cross-v" class="cross vertical"></div><div id="cross-p" class="cross horizontal"></div><div id="cross-q" class="cross horizontal"></div><div id="tag-p" class="axis-tag"></div><div id="tag-q" class="axis-tag"></div><div id="tag-t" class="axis-tag time-tag"></div></div><div class="hint"><span>上下圖同一根 K 棒 · 橫線標示收盤／成交量 · 滾輪縮放 · 拖曳平移</span><span id="range"></span></div></div>
 <script>
 const f=__FIGURE__, m=__META__, g=document.getElementById('chart'), N=m.labels.length;
-const tf=document.getElementById('timeframe');tf.value=({'1d':'日K','1wk':'周K','1mo':'月K','15m':'15分','30m':'30分','60m':'60分'})[m.timeframe];tf.onchange=()=>parent.postMessage({type:'cq-timeframe',value:tf.value},'*');
+const tf=document.getElementById('timeframe');tf.value=({'1d':'日K','1wk':'周K','1mo':'月K','1m':'1分','15m':'15分','30m':'30分','60m':'60分'})[m.timeframe];tf.onchange=()=>parent.postMessage({type:'cq-timeframe',value:tf.value},'*');
 let autoY=true, showDeduct=true, pending=false, raf=0, follow=true;
 const baseAnnotations=f.layout.annotations||[];
 const initial=[Math.max(-.7,N-Math.min(60,N)-.7),N+1.5];
@@ -1147,13 +1361,13 @@ function updateOHLC(i){
  for(const k of ['open','high','low','close'])document.getElementById('v-'+k).textContent=fmt(m[k][i]);
  document.getElementById('v-volume').textContent=(Number(m.volume[i])/1000).toLocaleString('en-US',{maximumFractionDigits:1});
  document.getElementById('v-close').style.color=m.close[i]>=m.open[i]?'#f17c7e':'#55c8a4';
- document.getElementById('ma-values').textContent=m.priceLines.map((l,j)=>`MA${[3,10,52][j]} ${fmt(l[i])}`).join('    ·    ');
+ document.getElementById('ma-values').textContent=m.priceLines.map((l,j)=>`MA${[3,10,21,52][j]} ${fmt(l[i])}`).join('    ·    ');
 }
 function updateDeduct(){
  const box=document.getElementById('deduct-values');
  box.style.display=showDeduct?'block':'none';
- box.innerHTML=[["下根均價扣抵",[3,10,52],m.close,1,"MA"],["下根均量扣抵",[5,13,34],m.volume,1000,"VMA"]].map(([title,periods,data,unit,prefix])=>
- '<div class="deduct-row"><span class="deduct-title">'+title+'</span>'+periods.map((n,j)=>{const i=N-n;const value=i>=0?data[i]:null;return '<span class="deduct-item" style="color:'+['#d6bb7c','#9fb8c7','#a88e68'][j]+'" title="'+(i>=0?m.labels[i]+'：下一根會移出這筆資料':'資料不足')+'">'+prefix+n+' <b>'+(value==null?'—':unit===1000?(value/unit).toLocaleString('en-US',{maximumFractionDigits:1})+' 張':fmt(value))+'</b></span>';}).join('')+'</div>').join('');
+ box.innerHTML=[["下根均價扣抵",[3,10,21,52],m.close,1,"MA"],["下根均量扣抵",[5,13,34],m.volume,1000,"VMA"]].map(([title,periods,data,unit,prefix])=>
+ '<div class="deduct-row"><span class="deduct-title">'+title+'</span>'+periods.map((n,j)=>{const i=N-n;const value=i>=0?data[i]:null;return '<span class="deduct-item" style="color:'+(prefix==='MA'?['#d6bb7c','#9fb8c7','#86b7ee','#a88e68']:['#d6bb7c','#9fb8c7','#86b7ee'])[j]+'" title="'+(i>=0?m.labels[i]+'：下一根會移出這筆資料':'資料不足')+'">'+prefix+n+' <b>'+(value==null?'—':unit===1000?(value/unit).toLocaleString('en-US',{maximumFractionDigits:1})+' 張':fmt(value))+'</b></span>';}).join('')+'</div>').join('');
 }
 updateDeduct();
 const crossIds=['cross-v','cross-p','cross-q','tag-p','tag-q','tag-t'];
@@ -1182,7 +1396,7 @@ function rangePatch(r){
  if(autoY){let lo=Infinity,hi=-Infinity,vol=0;for(let i=a;i<=b;i++){
   lo=Math.min(lo,m.low[i]);hi=Math.max(hi,m.high[i]);vol=Math.max(vol,m.volume[i]||0);
   m.priceLines.forEach((l,j)=>{if(l[i]!=null&&g.data[j+1].visible!=='legendonly'){lo=Math.min(lo,l[i]);hi=Math.max(hi,l[i]);}});
-  m.volumeLines.forEach((l,j)=>{if(l[i]!=null&&g.data[j+5].visible!=='legendonly')vol=Math.max(vol,l[i]);});
+  m.volumeLines.forEach((l,j)=>{if(l[i]!=null&&g.data[j+2+m.priceLines.length].visible!=='legendonly')vol=Math.max(vol,l[i]);});
  }
  if(Number.isFinite(lo)&&Number.isFinite(hi)){const span=Math.max(hi-lo,Math.abs(hi)*.01,.01);p['yaxis.range']=[lo-span*.09,hi+span*(showDeduct?.24:.09)];p['yaxis.autorange']=false;}
  p['yaxis2.range']=[0,Math.max(vol,1)*(showDeduct?1.65:1.12)];p['yaxis2.autorange']=false;
@@ -1281,12 +1495,63 @@ READABLE_CSS="""<style>
 </style>"""
 
 
+@st.cache_data(ttl=30,show_spinner=False,max_entries=128)
+def selected_quote19(code,ticker,mode):
+    now=pd.Timestamp(taipei_now())
+    try:
+        if mode=='全市場盤中快照':
+            channel=('otc_' if ticker.endswith('.TWO') else 'tse_')+code+'.tw'
+            q=mis_batch([channel]).get(code)
+            if not q:raise ValueError('MIS未提供成交價')
+        elif mode=='Yahoo 延遲盤中掃描':
+            state=yahoo_state16()
+            if clock.monotonic()<state['cooldown']:raise ValueError('Yahoo限流冷卻中')
+            if not state['lock'].acquire(blocking=False):raise ValueError('Yahoo全市場更新中')
+            try:
+                f=yahoo_minute_frame(yf.Ticker(ticker).history(period='1d',interval='1m',auto_adjust=False,actions=False,raise_errors=True,timeout=8))
+                f=f.loc[(f.index.date==now.date())&(f.index+pd.Timedelta(minutes=1)<=now)].between_time('09:00','13:30')
+                if f.empty:raise ValueError('Yahoo尚無今日完成分鐘棒')
+                previous=expected_session(now.to_pydatetime().replace(hour=8,minute=0))
+                refs,_,_=closing_quotes(previous)
+                ref=refs.get(code,{}).get('price')
+                if not ref:raise ValueError('尚無正式昨收')
+                q=aligned_quote16(code,f,f.index[-1],ref)
+            finally:state['lock'].release()
+        else:return None,None
+        age=(now-q['timestamp']).total_seconds()
+        if q['timestamp'].date()!=now.date() or age< -5:raise ValueError('來源報價日期或時間不符')
+        return q,None
+    except Exception as exc:
+        if mode=='Yahoo 延遲盤中掃描' and is_rate_limit16(exc):yahoo_state16()['cooldown']=clock.monotonic()+300
+        return None,str(exc)
+
+
+def quote_label19(quote,mode,now=None):
+    now=pd.Timestamp(now or taipei_now())
+    source='MIS' if mode=='全市場盤中快照' else 'Yahoo 1分K' if mode=='Yahoo 延遲盤中掃描' else '券商報價檔' if mode=='券商即時報價檔' else '交易所收盤'
+    if not quote:return '歷史K線 · 無當次盤中成交價'
+    stamp=quote['timestamp'];age=max(0,(now-stamp).total_seconds())
+    if stamp.date()!=now.date():phase='歷史報價'
+    elif now.time()>=time(13,30):phase='收盤資料' if mode in ('全市場盤中快照','全市場收盤') else '盤後最後報價'
+    elif now.time()<time(9):phase='盤前資料'
+    elif mode=='Yahoo 延遲盤中掃描':phase=f'分鐘快照 · 距今 {age/60:.1f} 分鐘'
+    elif age>120:phase=f'保留成交價 · 距今 {age/60:.1f} 分鐘'
+    else:phase=f'盤中快照 · 距今 {age:.0f} 秒'
+    return f'{source} · {phase} · {stamp:%m/%d %H:%M:%S}'
+
+
+@st.fragment(run_every='30s')
 def render_chart(code,rs,chart_space,quote=None,stock_name=None,ticker=None,rs_period=10):
     ticker=ticker or f"{code}.TW"
+    mode=st.session_state.get('scan_mode16','全市場收盤')
+    quote_error=None;now=pd.Timestamp(taipei_now())
+    if time(9)<=now.time()<time(13,30) and expected_session(now.to_pydatetime().replace(hour=14))==now.date():
+        latest,quote_error=selected_quote19(code,ticker,mode)
+        if latest and (not quote or latest['timestamp']>=quote['timestamp']):quote=latest
     st.markdown(f'<div class="stock-head"><h2>{escape(stock_name or stock_names.get(code,code))}</h2><span class="stock-code">{escape(code)}</span></div>',unsafe_allow_html=True)
-    options={'日K':'1d','周K':'1wk','月K':'1mo','15分':'15m','30分':'30m','60分':'60m'}
+    options={'日K':'1d','周K':'1wk','月K':'1mo','1分':'1m','15分':'15m','30分':'30m','60分':'60m'}
     tf=st.session_state.get('timeframe11','日K')
-    period="1y" if "分" not in tf else "60d"
+    period="5d" if tf=="1分" else ("1y" if "分" not in tf else "60d")
     frame,stamp=fetch_chart(ticker,period,options[tf])
     if frame.empty:
         st.error("行情來源目前無可用資料。請更新或切換標的。")
@@ -1306,12 +1571,13 @@ def render_chart(code,rs,chart_space,quote=None,stock_name=None,ticker=None,rs_p
         display_price=quote["price"];change=display_price-quote["reference"];pct=change/quote["reference"]*100
     cls="up" if change>0 else "down" if change<0 else ""
     rs_text=(f"{rs:+.2f}% · "+("相對領先" if rs>1e-10 else "相對落後" if rs< -1e-10 else "同步")) if rs is not None else "未取得"
-    st.markdown(f'<div class="price-line"><span class="last-price">{display_price:,.2f}</span><span class="{cls}">{change:+,.2f} ({pct:+.2f}%)</span><span class="price-details">{"當日掃描價" if quote else "較前一根 "+tf} · {rs_period}日 RS {rs_text}</span></div>',unsafe_allow_html=True)
+    st.markdown(f'<div class="price-line"><span class="last-price">{display_price:,.2f}</span><span class="{cls}">{change:+,.2f} ({pct:+.2f}%)</span><span class="price-details">{"最新取得價" if quote else "較前一根 "+tf} · {rs_period}日 RS {rs_text}</span></div>',unsafe_allow_html=True)
     required=expected_session();actual=pd.Timestamp(frame.attrs.get("last_trade",str(frame.index[-1].date()))).date()
     ok=required is not None and actual>=required
     state=f"資料涵蓋 {actual}｜核對交易日 {required}" if ok else f"資料未齊：目前 {actual}｜應有 {required or '日曆待確認'}"
-    if quote:state=f"掃描報價 {quote['timestamp'].strftime('%m/%d %H:%M:%S')}｜圖表日 {actual}"
-    if "分" in tf:state=f"分鐘資料 {frame.index[-1].strftime('%m/%d %H:%M')}｜來源可能延遲"
+    if quote:state=quote_label19(quote,mode)+f"｜圖表日 {actual}"
+    if "分" in tf:state+=f"｜K線截至 {frame.index[-1]:%m/%d %H:%M}"
+    if quote_error:state+="｜更新未完成，保留原成交時間"
     st.markdown(f'<div class="strip {"ok" if ok else "bad"}"><span>{escape(state)}</span><span>取得 {escape(stamp.split(" ")[-1])}</span></div>',unsafe_allow_html=True)
     content=chart_html(frame,ticker,options[tf],max(180,chart_space-190))
     event=interactive_chart_component()(html=content,height=chart_space,key='chart11_'+ticker,default=None)
@@ -1320,9 +1586,66 @@ def render_chart(code,rs,chart_space,quote=None,stock_name=None,ticker=None,rs_p
         if event.get('timeframe') in options and event['timeframe']!=tf:
             st.session_state.timeframe11=event['timeframe'];st.rerun()
     source=frame.attrs.get("source","Yahoo")
-    note=f"{source} · 未還原價 · 非即時報價"
+    note=f"K線來源：{source} · 未還原價 · 所選個股報價與板塊排名分別更新"
     if len(frame)<52:note+=f" · 僅 {len(frame)} 根，MA52 尚不足"
     st.markdown(f'<div class="note-line" title="{escape(note)}">{escape(note)}</div>',unsafe_allow_html=True)
+
+
+def yahoo_minute_frame(frame):
+    if frame is None or frame.empty:return pd.DataFrame()
+    frame=frame.copy()
+    idx=pd.DatetimeIndex(frame.index)
+    if idx.tz is None:raise ValueError('Yahoo 分鐘時間缺少時區，拒絕猜測')
+    frame.index=idx.tz_convert('Asia/Taipei')
+    return frame[~frame.index.duplicated(keep='last')].sort_index().dropna(subset=['Close'])
+
+
+@st.cache_resource
+def scan_executor18():
+    # Bounded process-wide pool; one outstanding scan per browser session.
+    return ThreadPoolExecutor(max_workers=2,thread_name_prefix='cqr-scan')
+
+
+def async_snapshot18(state,key,loader,force=False):
+    now=clock.monotonic()
+    jobs=state.setdefault('scan_jobs18',{})
+    job=jobs.get('active')
+    if job and job['future'].done():
+        job_key=job['key']
+        try:
+            result=job['future'].result()
+            if not result.get('quotes') and result['all_sectors'].empty:
+                raise ValueError('；'.join(result['missing']) or '沒有有效行情')
+            jobs[job_key]={'result':result,'finished':now,'error':None}
+            if result.get('yahoo_diagnostic') is not None:
+                state['scan_diagnostic16']=result['yahoo_diagnostic']
+        except Exception as exc:
+            entry=jobs.setdefault(job_key,{})
+            entry.update(finished=now,error=str(exc))
+            state['scan_diagnostic16']={**state.get('scan_diagnostic16',{}),
+                'latest_attempt_error':str(exc),'latest_attempt_at':str(taipei_now())}
+        jobs.pop('active',None)
+    entry=jobs.get(key,{})
+    if 'active' not in jobs and (force or now-entry.get('finished',-1e12)>=300):
+        jobs['active']={'key':key,'future':scan_executor18().submit(loader),'started':now}
+    result=entry.get('result')
+    if result is None:
+        result=dict(all_sectors=pd.DataFrame(columns=['趨勢','族群板塊','動能(%)','漲幅(%)','覆蓋','資料日']),
+            groups={},missing=[entry['error']] if entry.get('error') else [],valid=0,quotes={},
+            market_price=None,asof='尚未取得',stamp='—',source='背景掃描中' if 'active' in jobs else '來源未就緒',effective_label='等待資料')
+    return result,bool(entry.get('error')),entry.get('error')
+
+
+@st.fragment(run_every='2s')
+def scan_status18():
+    jobs=st.session_state.get('scan_jobs18',{})
+    job=jobs.get('active')
+    if job:
+        if job['future'].done():st.rerun()
+        elapsed=int(clock.monotonic()-job['started'])
+        st.caption(f'更新中 · {elapsed} 秒')
+    else:
+        pass
 
 
 @st.fragment(run_every="300s")
@@ -1334,32 +1657,42 @@ def dashboard(width,height):
     title,view,refresh,details=st.columns([4.7,3,1.5,1.8])
     with title:st.markdown('<div class="brand"><div class="brand-left"><div class="monogram">C</div><div><div class="eyebrow">CHEN QUANT RESEARCH</div><div class="brand-title">全市場動能決策臺</div></div></div></div>',unsafe_allow_html=True)
     with view:
+        if st.session_state.get("view11") not in (None,"K線量能","法人","資券"):st.session_state["view11"]="K線量能"
         panel=st.segmented_control("個股資訊",["K線量能","法人","資券"],default="K線量能",key="view11",label_visibility="collapsed") or "K線量能"
+    force_refresh=False
     with refresh:
         if st.button("↻ 全部更新",use_container_width=True):
-            for fn in (chip_history_reports,chip_report,latest_chip_report,market_history_window,historical_close_snapshot,archived_month,ranking_history,official_month,otc_month,chart_history,screening_snapshot,futures_catalog,market_universe,public_quotes,closing_quotes):fn.clear()
-            st.rerun()
+            if st.session_state.get('scan_jobs18',{}).get('active'):
+                st.toast('已有更新進行中，完成後會顯示結果。')
+            else:
+                force_refresh=True
+                for fn in (chart_history,stock_chip_history,chip_history_reports,chip_report,selected_quote19):fn.clear()
     with details:
         with st.popover("掃描設定／說明",use_container_width=True):
             default_mode=0 if time(9)<=taipei_now().time()<time(13,30) else 2
-            modes=["全市場盤中快照","券商即時報價檔","全市場收盤","原15族群多日"]
-            if "scan_mode6" not in st.session_state:st.session_state.scan_mode6=modes[default_mode]
-            mode=st.selectbox("資料模式",modes,key="scan_mode6",help="決定行情從哪裡來，以及比較今天或過去幾天。各模式的範圍如下方說明。")
+            modes=["全市場盤中快照","券商即時報價檔","全市場收盤","原15族群多日","Yahoo 延遲盤中掃描"]
+            if "scan_mode16" not in st.session_state:st.session_state.scan_mode16=modes[default_mode]
+            mode=st.selectbox("資料模式",modes,key="scan_mode16",help="決定行情從哪裡來，以及比較今天或過去幾天。各模式的範圍如下方說明。")
             periods=st.selectbox("相對強弱比較期（交易日）",[5,10,20],index=1,key="period9",help="所有模式皆可選 5／10／20 個交易日。RS 依此期間計算；當日漲幅只看資料日期當天。盤中以目前有效報價作為比較終點。")
             rs_filter=st.selectbox("族群內個股範圍",["全部","只看 RS > 0","只看 RS ≤ 0"],key="rs_scope7",help="全部：保留所有有效成分。RS > 0：跑贏所屬族群。RS ≤ 0：與族群同步或落後族群；不一定是股價下跌。")
             rising_only=st.checkbox("只看自身漲幅 > 0",value=False,key="rising7",help="觀察拉回時請保持關閉；RS < 0 只代表落後族群，不等於已形成買點。")
             futures_only=st.checkbox("只看有股期",value=False,key="futures7",help="只留下期交所名單中有對應股票期貨的現股。表格與 K 線仍是現股行情，不是期貨成交價。")
             max_age=st.selectbox("報價最多可落後幾秒",[60,120,300],index=1,disabled=mode not in ("全市場盤中快照","券商即時報價檔"),key="age7",help="例如 120 秒：超過兩分鐘的報價不參與本次排名。股票與大盤的報價時間差也不能超過這個值。不是畫面刷新間隔；正式收盤資料不套用此限制。")
+            if mode=="Yahoo 延遲盤中掃描":
+                max_age=st.selectbox('Yahoo 資料最多落後幾分鐘',[10,20,30],index=2,key='yahoo_age16')*60
+                alignment=st.selectbox('個股與大盤最多相差幾分鐘',[1,3,5],index=2,key='yahoo_align16')*60
+                st.caption('盤中直接下載Yahoo當日1分K；預設容許落後30分鐘、與大盤差5分鐘。昨收來自正式日線，不再要求前日13:29分鐘棒。盤後此模式仍檢查Yahoo分鐘資料，標示盤後歷史快照，不冒充收盤價。')
             feed_path=st.text_input("券商報價 JSON 路徑",value="",disabled=mode!="券商即時報價檔",key="feed7",help="僅在券商即時報價檔模式使用；請使用已授權的券商行情程式原子更新此檔案。")
             st.markdown("先按所選期間比較各板塊與加權指數，再查看板塊內的股票。板塊 RS 正、零、負值都會列出，並由高到低排列。下面的個股條件只影響股票清單，不會改變族群排名。")
             with st.expander("資料模式：應該選哪一種？",expanded=True):
-                st.markdown("- **全市場盤中快照**：交易時段讀取公開報價，搭配歷史收盤計算所選 5／10／20 日強弱；盤後、盤前或休市改用最近已完成交易日的正式收盤資料，日期會顯示在畫面上。公開報價不保證每筆成交立即到達。\n- **券商即時報價檔**：讀取你另外執行的券商行情程式所產生的檔案。本頁不會替你登入券商；檔案必須持續更新，並包含加權指數及股票報價。\n- **全市場收盤**：只看最近已完成交易日的正式收盤結果。當日收盤尚未發布時會顯示來源未就緒，或保留舊結果並標示非即時。\n- **原15族群多日**：使用原本的自訂股票池，比較過去 5、10 或 20 個交易日；不是全市場掃描。")
+                st.markdown("**Yahoo 延遲盤中掃描**：Yahoo當日分鐘資料＋正式昨收。盤後保留此來源供診斷，不自動切換正式收盤。指數與個股保留實際來源時間；預設最大延遲30分鐘、對齊差5分鐘。這是延遲觀察，不保證逐筆即時。原本的全市場盤中快照則是MIS來源。")
+                st.markdown("- **全市場盤中快照**：交易時段讀取證交所 MIS 公開報價（不是Yahoo），搭配歷史收盤計算所選 5／10／20 日強弱；盤後、盤前或休市改用最近已完成交易日的正式收盤資料，日期會顯示在畫面上。公開報價不保證每筆成交立即到達。\n- **券商即時報價檔**：讀取你另外執行的券商行情程式所產生的檔案。本頁不會替你登入券商；檔案必須持續更新，並包含加權指數及股票報價。\n- **全市場收盤**：只看最近已完成交易日的正式收盤結果。當日收盤尚未發布時會顯示來源未就緒，或保留舊結果並標示非即時。\n- **原15族群多日**：使用原本的自訂股票池，比較過去 5、10 或 20 個交易日；不是全市場掃描。")
             with st.expander("篩選條件：每個選項代表什麼？"):
                 st.markdown("- **比較幾個交易日**：所有模式皆可選 5／10／20 個交易日。比較 N 日前的收盤到目前有效報價；盤後則比較到該日正式收盤。需要 N＋1 個交易日的價格，不能用日曆天代替。當日漲幅欄不會跟著變成多日漲幅。\n- **族群內個股範圍**：全部＝不限制個股 RS；RS > 0＝跑贏族群；RS ≤ 0＝與族群同步或落後。負 RS 不等於下跌，也不代表已經出現買點。\n- **只看自身漲幅 > 0**：勾選後只留下股價上漲的股票。要觀察下跌或拉回股票，請取消勾選。\n- **只看有股期**：只留下有對應股票期貨的現股。商品代碼可在下方名單查詢；此處顯示的仍是現股價格。股期名單無法確認時，不會猜測哪些股票有股期。\n- **報價最多可落後幾秒**：只用於盤中報價檢查。選 120 就代表超過兩分鐘的報價不計算，股票與大盤時間差也須在兩分鐘內；正式收盤資料不受此限制。\n- **券商報價 JSON 路徑**：填入執行這個 Web 程式的電腦上，券商行情檔案的完整位置；不是券商網址。\n\n條件會一起生效，例如選 RS ≤ 0 再勾選「只看自身漲幅 > 0」，留下的是『股價有漲，但沒有跑贏族群』的股票。")
             with st.expander("表格數字：動能、漲幅、覆蓋怎麼看？"):
-                st.markdown("**相較大盤動能%／相較族群動能%（RS）**是相對表現，不是單純漲幅。族群與加權指數比較；個股與所屬族群比較。正值是跑贏，負值是落後。公式為 [(1＋標的漲幅) ÷ (1＋比較對象漲幅) − 1] × 100，公式中的漲幅用小數表示。\n\n**當日漲幅%**只看資料日期當天。全市場模式以當日交易所參考價為起點；原15族群使用前一交易日收盤。板塊當日漲幅是符合當日與所選歷史期間資料要求的成分股等權平均。切換比較期可能改變有效成分，但這一欄始終只表示單日漲幅。板塊多日表現則以固定成分股每日等權報酬連乘計算。\n\n**覆蓋**是『當日報價與所選期間歷史均齊全的成分股數／族群全部股數』。例如 18/20，代表 20 檔有 18 檔能參與計算；至少 80% 且至少 3 檔才顯示族群，不滿 3 檔的族群須全部有效。\n\n**可比較成分／名單股數**顯示這次有多少股票同時具備有效報價及足夠歷史，並且所屬板塊達到覆蓋門檻。**強勢／有效／全產業**依序表示跑贏大盤的族群數、資料足夠的族群數、股票名單中的全部族群數。覆蓋不足代表資料不齊，不等於市場沒有強勢股票。")
+                st.markdown("**相較大盤動能%／相較族群動能%（RS）**是相對表現，不是單純漲幅。族群與加權指數比較；個股與所屬族群比較。正值是跑贏，負值是落後。公式為 [(1＋標的漲幅) ÷ (1＋比較對象漲幅) − 1] × 100，公式中的漲幅用小數表示。\n\n**當日漲幅%**只看資料日期當天。MIS／正式收盤以當日交易所參考價為起點；Yahoo模式以正式前日收盤為起點（除權息日與官方漲幅可能不同）；原15族群使用前一交易日收盤。板塊當日漲幅是符合當日與所選歷史期間資料要求的成分股等權平均。切換比較期可能改變有效成分，但這一欄始終只表示單日漲幅。板塊多日表現則以固定成分股每日等權報酬連乘計算。\n\n**覆蓋**是『當日報價與所選期間歷史均齊全的成分股數／族群全部股數』。例如 18/20，代表 20 檔有 18 檔能參與計算；至少 80% 且至少 3 檔才顯示族群，不滿 3 檔的族群須全部有效。\n\n**進入板塊排名／全市場**是最後通過全部門檻的成分股，不是下載成功數。某板塊不到80%，其資料齊全個股也不計入最終排名數。歷史缺漏會以Yahoo未還原日線依精確日期補齊，每輪有數量與時間上限，限流時保留缺口。**強勢／有效／全產業**依序表示跑贏大盤的族群數、資料足夠的族群數、股票名單中的全部族群數。覆蓋不足代表資料不齊，不等於市場沒有強勢股票。")
             with st.expander("資料更新、掃描範圍與圖表扣抵"):
-                st.markdown("**更新方式**：畫面每 5 分鐘自動刷新一次。按「全部更新」會立刻重新抓取，不必等滿 5 分鐘；資料供應端仍可能延遲。歷史收盤會共用快取，首次全市場多日掃描較慢，切換天期可重用已下載的歷史資料。按「全部更新」可重查行情、股票名單與股期名單；K線週期可在圖內扣抵標示旁切換。資料日期與來源時間會顯示在畫面上。\n\n**來源失敗**：盤中不會拿昨收冒充即時報價。若本次工作階段已有相同模式、日期與比較期等設定的成功結果，會保留並標示『非即時』；沒有可保留結果就顯示來源未就緒。收盤資料尚未發布時，也不會假裝已取得當日收盤。\n\n**全市場範圍**：官方名單中的上市、上櫃普通股，依官方產業分類分組。不含興櫃、ETF、TDR、權證與特別股。這是成分股等權計算的族群表現，不是官方市值加權產業指數。股票名單快取 6 小時，可按全部更新重查。\n\n**圖表扣抵**：預設開啟。MA3／10／52 是均價，VMA5／13／34 是均量；圖上箭頭指出扣抵那根 K 棒，數值列顯示『下一根新增時會移出的收盤價或成交量』。以最新 K 棒為準，不隨滑鼠移到歷史 K 棒而改變；滑鼠停在扣抵數字可看日期。量以張顯示，1 張＝1,000 股。縮放後若扣抵位置在畫面外，數值仍會保留；資料不足顯示 —。\n\n例如：下一根 10 期均價＝目前 10 期均價＋（下一根收盤價−MA10 扣抵價）÷10。均量同理。盤中最後一根尚未收完，當根數值仍會變動。日 K 的一期是一天，週 K 的一期是一週。\n\n圖表與多日排名使用未還原價格，除權息可能影響變化。RS 用來找相對表現，不是自動下單訊號。")
+                st.markdown("**更新方式**：全市場排名每 5 分鐘檢查是否需要背景更新；K線頁所選個股盤中每30秒獨立查詢最新報價，不重跑全市場。切換頁籤沿用上次結果，背景完成後更新畫面。首次開啟個股K線或籌碼仍需載入該股資料。按「全部更新」會立即排入背景更新；已有更新時不重複送出；資料供應端仍可能延遲。歷史收盤會共用快取，首次全市場多日掃描較慢，切換天期可重用已下載的歷史資料。按「全部更新」重查行情及籌碼；歷史依快取到期及缺口補齊，保留名單與已補齊日線，避免重複下載；K線週期可在圖內扣抵標示旁切換。資料日期與來源時間會顯示在畫面上。\n\n**來源失敗**：盤中不會拿昨收冒充即時報價。若本次工作階段已有相同模式、日期與比較期等設定的成功結果，會保留並標示『非即時』；沒有可保留結果就顯示來源未就緒。收盤資料尚未發布時，也不會假裝已取得當日收盤。\n\n**全市場範圍**：官方名單中的上市、上櫃普通股，依官方產業分類分組。不含興櫃、ETF、TDR、權證與特別股。這是成分股等權計算的族群表現，不是官方市值加權產業指數。股票名單快取 6 小時，到期後重查。\n\n**圖表扣抵**：預設開啟。MA3／10／21／52 是均價，VMA5／13／34 是均量；圖上箭頭指出扣抵那根 K 棒，數值列顯示『下一根新增時會移出的收盤價或成交量』。以最新 K 棒為準，不隨滑鼠移到歷史 K 棒而改變；滑鼠停在扣抵數字可看日期。量以張顯示，1 張＝1,000 股。縮放後若扣抵位置在畫面外，數值仍會保留；資料不足顯示 —。\n\n例如：下一根 10 期均價＝目前 10 期均價＋（下一根收盤價−MA10 扣抵價）÷10。均量同理。盤中最後一根尚未收完，當根數值仍會變動。日 K 的一期是一天，週 K 的一期是一週。\n\n圖表與多日排名使用未還原價格，除權息可能影響變化。RS 用來找相對表現，不是自動下單訊號。")
             with st.expander("Momentum 電池怎麼看？"):
                 st.markdown("電量以目前所選期間的 RS 換算：50＋50×tanh(RS百分點÷10)，範圍0～100。RS＝0為50；RS越高電量越滿，越低越空。板塊比較大盤，個股比較所屬族群；不隨清單名次或篩選條件改變。這是相對多方強度，不是勝率，也不代表自身股價一定上漲。")
             with st.expander("法人與融資融券怎麼看？"):
@@ -1375,13 +1708,15 @@ def dashboard(width,height):
     universe=pd.DataFrame();quotes={};groups={};missing=[];source="";valid=0
     effective_label=mode;frozen=False;update_error=None
     period=periods
-    snapshot_key=repr(("snapshot9",mode,period,str(taipei_now().date()),feed_path if mode=="券商即時報價檔" else "",max_age if mode in ("全市場盤中快照","券商即時報價檔") else None))
+    snapshot_key=repr(("snapshot9",mode,period,str(taipei_now().date()),feed_path if mode=="券商即時報價檔" else "",max_age if mode in ("全市場盤中快照","券商即時報價檔","Yahoo 延遲盤中掃描") else None,st.session_state.get("yahoo_align16")))
     with st.spinner("讀取行情並套用顯示條件…"):
         try:
             universe=market_universe()
             stock_names.update(dict(zip(universe.code,universe.name)))
             def load_scan():
-                local_quotes={};label=mode
+                local_quotes={};label=mode;yahoo_diag=None
+                if force_refresh:
+                    for fn in (yahoo_scan16,public_quotes,closing_quotes):fn.clear()
                 if mode=="原15族群多日":
                     table,market,stamp,excluded,local_groups=screening_snapshot(period)
                     price=float(market.Close.iloc[-1]) if not market.empty else None
@@ -1394,16 +1729,22 @@ def dashboard(width,height):
                         day=expected_session()
                         if day is None:raise ValueError("交易日曆待確認")
                         local_quotes,errors,src=closing_quotes(day)
+                    elif mode=="Yahoo 延遲盤中掃描":
+                        local_quotes,errors,src,day,label,yahoo_diag=load_yahoo16(universe,max_age,alignment)
                     elif mode=="券商即時報價檔":local_quotes,errors,src=broker_quotes(feed_path,max_age=max_age)
                     else:local_quotes,errors,src,day,label=session_quote_snapshot(universe,max_age)
-                    table,local_groups,excluded,count=multiday_market_tables(universe,local_quotes,period,max_age=max_age,closing_day=day)
+                    try:
+                        table,local_groups,excluded,count=multiday_market_tables(universe,local_quotes,period,max_age=max_age,closing_day=day)
+                    except Exception as exc:
+                        table=pd.DataFrame(columns=["趨勢","族群板塊","動能(%)","漲幅(%)","覆蓋","資料日"])
+                        local_groups={};excluded=["RS計算未完成："+str(exc)];count=0
                     excluded.extend(errors)
                     m=local_quotes.get('^TWII');price=m['price'] if m else None
                     date=m['timestamp'].strftime('%m/%d %H:%M') if m else "無有效報價"
                     stamp=taipei_now().strftime('%H:%M:%S')
                 return dict(all_sectors=table,groups=local_groups,missing=excluded,valid=count,quotes=local_quotes,
-                            market_price=price,asof=date,stamp=stamp,source=src,effective_label=label)
-            scan,frozen,update_error=resolve_snapshot(st.session_state,snapshot_key,load_scan)
+                            market_price=price,asof=date,stamp=stamp,source=src,effective_label=label,yahoo_diagnostic=yahoo_diag)
+            scan,frozen,update_error=async_snapshot18(st.session_state,snapshot_key,load_scan,force_refresh)
             all_sectors=scan['all_sectors'];groups=scan['groups'];missing=list(scan['missing']);valid=scan['valid'];quotes=scan['quotes']
             market_price=scan['market_price'];asof=scan['asof'];stamp=scan['stamp'];source=scan['source'];effective_label=scan['effective_label']
             if frozen:
@@ -1414,20 +1755,24 @@ def dashboard(width,height):
             all_sectors=pd.DataFrame(columns=["趨勢","族群板塊","動能(%)","漲幅(%)","覆蓋","資料日"])
             market_price=None;asof="未取得";stamp=taipei_now().strftime('%H:%M:%S');missing=[str(exc)]
             source=mode+" · 來源未就緒";effective_label="來源未就緒"
+    scan_status18()
     periods=period
     sectors=all_sectors.copy()
     strong_count=int((all_sectors['動能(%)']>0).sum())
     total=len(universe) if mode!="原15族群多日" else len({t for a in sector_stocks.values() for t in a})
     nsectors=15 if mode=="原15族群多日" else (universe.sector.nunique() if not universe.empty else 0)
     price_text=f"{market_price:,.2f}" if market_price is not None else "—"
-    ratio=f"{valid/total:.1%}" if total else "—"
-    st.markdown(f'<div class="metric-row"><div class="metric"><div class="metric-label">加權指數 · {escape(asof)}</div><div class="metric-value">{price_text}</div></div><div class="metric"><div class="metric-label">可比較成分 / 名單股數</div><div class="metric-value gold">{valid:,} / {total:,}</div></div><div class="metric"><div class="metric-label">強勢 / 有效 / 全產業</div><div class="metric-value">{strong_count} / {len(all_sectors)} / {nsectors}</div></div><div class="metric"><div class="metric-label">{escape(effective_label)} · 行情覆蓋</div><div class="metric-value">{ratio}</div></div></div>',unsafe_allow_html=True)
+    initial_loading=bool(st.session_state.get('scan_jobs18',{}).get('active')) and not quotes
+    rank_text='載入中' if initial_loading else f'{valid:,} / {total:,}'
+    sector_text='—' if initial_loading else f'{strong_count} / {len(all_sectors)} / {nsectors}'
+    ratio='—' if initial_loading else (f"{valid/total:.1%}" if total else "—")
+    st.markdown(f'<div class="metric-row"><div class="metric"><div class="metric-label">加權指數 · {escape(asof)}</div><div class="metric-value">{price_text}</div></div><div class="metric"><div class="metric-label">進入板塊排名 / 全市場</div><div class="metric-value gold">{rank_text}</div></div><div class="metric"><div class="metric-label">強勢 / 有效 / 全產業</div><div class="metric-value">{sector_text}</div></div><div class="metric"><div class="metric-label">{escape(effective_label)} · 排名覆蓋</div><div class="metric-value">{ratio}</div></div></div>',unsafe_allow_html=True)
     left,right=st.columns([.40,.60],gap="medium")
     code=None;rs=None;selected=None
     with left:
         section("","板塊相對強弱", f"{periods}日 RS · 全部板塊")
         if sectors.empty:
-            st.info("當日行情或所選期間的歷史資料不足，尚無可比較的板塊。")
+            st.info("首次載入中，完成後自動顯示排名。" if st.session_state.get("scan_jobs18",{}).get("active") and not quotes else "尚無可比較板塊：報價、歷史資料或板塊覆蓋率尚未達標。")
             if missing:st.warning(str(missing[0]))
             if mode in ("全市場盤中快照","券商即時報價檔"):st.caption("盤中來源失敗不改用昨收；盤後改讀正式收盤資料。尚無成功結果時，請確認來源或稍後更新。")
         else:
@@ -1454,7 +1799,12 @@ def dashboard(width,height):
                 render_chip_trends(code,name,row.iloc[0].ticker if len(row) else code+'.TW',market,'institution' if panel=='法人' else 'margin',quotes.get(code),workspace)
 
         else:
-            st.info("先比較板塊與大盤，再查看板塊成分股；板塊與個股的正負 RS 皆會列出。點選左側個股檢視圖表。")
+            st.info("排名不足仍可檢查已取得報價的個股；這不代表該股已通過RS篩選。")
+            available=[c for c in quotes if c!='^TWII']
+            if available:
+                inspect_code=st.selectbox('獨立檢視已收到的個股',available,format_func=lambda c:c+' '+stock_names.get(c,c))
+                matched=universe.loc[universe.code==inspect_code]
+                render_chart(inspect_code,None,chart_space,quote=quotes[inspect_code],ticker=matched.iloc[0].ticker if len(matched) else None)
             if not universe.empty:
                 old={t.split('.')[0] for a in sector_stocks.values() for t in a};active=len(old&set(universe.code))
                 st.markdown(f"目前名單 **{len(universe):,} 檔／{universe.sector.nunique()} 產業**。原池 108 檔中，有 {active} 檔符合本次普通股名單，股數覆蓋率 **{active/len(universe):.2%}**。")
